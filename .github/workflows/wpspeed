@@ -1,0 +1,63 @@
+#include <iostream>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <chrono>
+#include <thread>
+
+#pragma comment(lib, "iphlpapi.lib")
+
+// Function to get total bytes sent and received across all interfaces
+bool getNetworkBytes(ULONG64 &bytesSent, ULONG64 &bytesRecv) {
+    // Allocate table for interfaces
+    DWORD dwSize = 0;
+    GetIfTable(NULL, &dwSize, FALSE); 
+    PMIB_IFTABLE pIfTable = (MIB_IFTABLE*)malloc(dwSize);
+
+    if (pIfTable == NULL) return false;
+    if (GetIfTable(pIfTable, &dwSize, FALSE) != NO_ERROR) {
+        free(pIfTable);
+        return false;
+    }
+
+    bytesSent = 0;
+    bytesRecv = 0;
+
+    for (DWORD i = 0; i < pIfTable->dwNumEntries; i++) {
+        MIB_IFROW row = pIfTable->table[i];
+        // Skip loopback interfaces
+        if (row.dwType != IF_TYPE_SOFTWARE_LOOPBACK) {
+            bytesSent += row.dwOutOctets;
+            bytesRecv += row.dwInOctets;
+        }
+    }
+
+    free(pIfTable);
+    return true;
+}
+
+int main() {
+    std::cout << "Monitoring network speed (KB/s). Press Ctrl+C to stop.\n";
+
+    ULONG64 oldSent, oldRecv;
+    getNetworkBytes(oldSent, oldRecv);
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        ULONG64 newSent, newRecv;
+        if (getNetworkBytes(newSent, newRecv)) {
+            double uploadKB = (newSent - oldSent) / 1024.0;
+            double downloadKB = (newRecv - oldRecv) / 1024.0;
+
+            std::cout << "Upload: " << uploadKB << " KB/s | "
+                      << "Download: " << downloadKB << " KB/s\n";
+
+            oldSent = newSent;
+            oldRecv = newRecv;
+        } else {
+            std::cerr << "Failed to read network statistics.\n";
+        }
+    }
+
+    return 0;
+}
