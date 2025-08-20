@@ -1,1 +1,232 @@
+<?php
+/**
+ * Plugin Name: Auto Spell Schekl
+ * Plugin URI:  https://example.com/auto-spell-schekl
+ * Description: Enable client-side spellcheck in editors and optionally perform a simple server-side spell-check/correction on post save (uses PHP pspell if available).
+ * Version:     1.0.0
+ * Author:      Your Name
+ * Author URI:  https://example.com
+ * License:     GPLv2 or later
+ * Text Domain: auto-spell-schekl
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class Auto_Spell_Schekl {
+
+	const OPTION_KEY = 'auto_spell_schekl_options';
+
+	public function __construct() {
+		add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_admin_js' ] );
+		add_action( 'admin_init', [ $this, 'register_settings' ] );
+		add_action( 'admin_menu', [ $this, 'register_settings_page' ] );
+		add_action( 'save_post', [ $this, 'maybe_spellcheck_on_save' ], 10, 3 );
+		register_uninstall_hook( __FILE__, [ __CLASS__, 'on_uninstall' ] );
+	}
+
+	/**
+	 * Enqueue JavaScript for admin editor pages to enable browser spellcheck.
+	 */
+	public function enqueue_admin_js( $hook ) {
+		// Only enqueue on post edit screens
+		if ( ! in_array( $hook, [ 'post.php', 'post-new.php' ], true ) ) {
+			return;
+		}
+
+		// Small inline script — enables spellcheck on editable areas
+		$inline = <<<JS
+(function(){
+	// Enable HTML5 spellcheck on contenteditable elements and textareas used by editors
+	function enableSpellcheck() {
+		// classic editor (TinyMCE): tinyMCE.activeEditor.getBody()
+		if ( window.tinymce && tinymce.activeEditor && tinymce.activeEditor.getBody ) {
+			try {
+				var body = tinymce.activeEditor.getBody();
+				if ( body && body.setAttribute ) body.setAttribute('spellcheck','true');
+			} catch(e) {}
+		}
+		// Gutenberg: contentEditable areas with data-rich-text attribute
+		var editors = document.querySelectorAll('[contenteditable="true"], textarea');
+		editors.forEach(function(el){
+			try { el.setAttribute('spellcheck','true'); } catch(e){}
+		});
+	}
+	// Run on load and after a short delay (blocks may be loaded dynamically)
+	document.addEventListener('DOMContentLoaded', enableSpellcheck);
+	setTimeout(enableSpellcheck, 1200);
+	// Also try periodically for dynamic editors
+	var interval = setInterval(function(){
+		enableSpellcheck();
+	}, 2000);
+	// Stop after 10 seconds to avoid indefinite polling
+	setTimeout(function(){ clearInterval(interval); }, 10000);
+})();
+JS;
+		wp_add_inline_script( 'jquery', $inline );
+	}
+
+	/**
+	 * Register a simple settings option (enable/disable auto-fix on save).
+	 */
+	public function register_settings() {
+		register_setting( 'auto_spell_schekl_group', self::OPTION_KEY, [
+			'sanitize_callback' => [ $this, 'sanitize_options' ],
+			'default'           => [ 'auto_fix_on_save' => 0 ],
+		] );
+	}
+
+	public function sanitize_options( $in ) {
+		return [
+			'auto_fix_on_save' => ! empty( $in['auto_fix_on_save'] ) ? 1 : 0,
+		];
+	}
+
+	public function register_settings_page() {
+		add_options_page(
+			__( 'Auto Spell Schekl', 'auto-spell-schekl' ),
+			__( 'Auto Spell Schekl', 'auto-spell-schekl' ),
+			'manage_options',
+			'auto-spell-schekl',
+			[ $this, 'render_settings_page' ]
+		);
+	}
+
+	public function render_settings_page() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		$options = get_option( self::OPTION_KEY, [ 'auto_fix_on_save' => 0 ] );
+		?>
+		<div class="wrap">
+			<h1><?php esc_html_e( 'Auto Spell Schekl Settings', 'auto-spell-schekl' ); ?></h1>
+			<form method="post" action="options.php">
+				<?php settings_fields( 'auto_spell_schekl_group' ); ?>
+				<?php do_settings_sections( 'auto_spell_schekl_group' ); ?>
+				<table class="form-table">
+					<tr valign="top">
+						<th scope="row"><?php esc_html_e( 'Auto-fix on Save', 'auto-spell-schekl' ); ?></th>
+						<td>
+							<label>
+								<input type="checkbox" name="<?php echo esc_attr( self::OPTION_KEY ); ?>[auto_fix_on_save]" value="1" <?php checked( 1, $options['auto_fix_on_save'] ?? 0 ); ?> />
+								<?php esc_html_e( 'Attempt to automatically replace misspelled words when a post is saved (server-side, requires PHP pspell).', 'auto-spell-schekl' ); ?>
+							</label>
+							<p class="description"><?php esc_html_e( 'If pspell is not available, this option has no server-side effect and client-side spellcheck will still be enabled in editors.', 'auto-spell-schekl' ); ?></p>
+						</td>
+					</tr>
+				</table>
+				<?php submit_button(); ?>
+			</form>
+		</div>
+		<?php
+	}
+
+	/**
+	 * On save_post, optionally run a simple server-side spell-check and replace
+	 * words with the first suggestion. THIS IS A SIMPLE DEMO — use with caution.
+	 *
+	 * @param int     $post_ID
+	 * @param WP_Post $post
+	 * @param bool    $update
+	 */
+	public function maybe_spellcheck_on_save( $post_ID, $post, $update ) {
+		// Only run for post types where this makes sense (posts/pages)
+		if ( wp_is_post_revision( $post_ID ) || 'auto-draft' === $post->post_status ) {
+			return;
+		}
+
+		$options = get_option( self::OPTION_KEY, [ 'auto_fix_on_save' => 0 ] );
+		if ( empty( $options['auto_fix_on_save'] ) ) {
+			return; // user didn't enable auto-fix on save
+		}
+
+		// Only proceed if pspell functions exist
+		if ( ! function_exists( 'pspell_new' ) || ! function_exists( 'pspell_check' ) ) {
+			// pspell not available — nothing to do
+			return;
+		}
+
+		// We only modify post_content (not title or meta) for safety in this simple plugin.
+		$content = $post->post_content;
+		if ( empty( $content ) ) {
+			return;
+		}
+
+		// Very simple: strip HTML tags, split into words, check each word; replace in HTML content when safe.
+		// This algorithm is naive: it may not handle punctuation, HTML entities, or code blocks perfectly.
+		$pspell_link = pspell_new( 'en' ); // default to English; you can extend to support other locales
+
+		if ( ! $pspell_link ) {
+			return;
+		}
+
+		// A safe approach: replace only in text nodes. For simplicity here we operate on plain text fallback.
+		// Extract text-only copy, correct that, then attempt to replace the content. This is imperfect but demonstrates the idea.
+		$text_only = wp_strip_all_tags( $content );
+		if ( strlen( $text_only ) < 4 ) {
+			return;
+		}
+
+		$tokens = preg_split('/(\s+)/u', $text_only, -1, PREG_SPLIT_DELIM_CAPTURE);
+		$changed = false;
+		foreach ( $tokens as $i => $tok ) {
+			// Only check word tokens (skip whitespace)
+			if ( trim( $tok ) === '' ) {
+				continue;
+			}
+			// Skip tokens with numbers or punctuation-heavy tokens
+			if ( preg_match('/[0-9_@#\$%\^&*:=+\/\\\\<>]/', $tok ) ) {
+				continue;
+			}
+			// Normalize for checking: remove leading/trailing punctuation
+			$clean = trim( $tok, " \t\n\r\0\x0B.,;:!?'\"()[]{}" );
+			if ( $clean === '' ) {
+				continue;
+			}
+			// pspell is case sensitive; check lowercase then preserve case if replacing
+			if ( ! pspell_check( $pspell_link, $clean ) ) {
+				$suggestions = pspell_suggest( $pspell_link, $clean );
+				if ( ! empty( $suggestions ) && is_array( $suggestions ) ) {
+					$best = $suggestions[0];
+					// preserve capitalization if needed
+					if ( ctype_upper( mb_substr( $clean, 0, 1 ) ) ) {
+						$best = ucfirst( $best );
+					}
+					// Replace only the clean portion inside the token
+					$tokens[ $i ] = str_replace( $clean, $best, $tok );
+					$changed = true;
+				}
+			}
+		}
+
+		if ( $changed ) {
+			// Rebuild plain corrected text
+			$corrected_text = implode( '', $tokens );
+			// A naive replace: replace the first occurrence of the plain text in the HTML content.
+			// This is not perfect — might replace text inside attributes — but keeps the demo simple.
+			$pos = mb_strpos( $content, $text_only );
+			if ( $pos !== false ) {
+				$new_content = mb_substr( $content, 0, $pos ) . $corrected_text . mb_substr( $content, $pos + mb_strlen( $text_only ) );
+				// Prepare to update the post (avoid infinite loop)
+				remove_action( 'save_post', [ $this, 'maybe_spellcheck_on_save' ], 10 );
+				wp_update_post( [
+					'ID'           => $post_ID,
+					'post_content' => $new_content,
+				] );
+				// Re-add action
+				add_action( 'save_post', [ $this, 'maybe_spellcheck_on_save' ], 10, 3 );
+			}
+		}
+	}
+
+	/**
+	 * Uninstall cleanup
+	 */
+	public static function on_uninstall() {
+		delete_option( self::OPTION_KEY );
+	}
+}
+
+new Auto_Spell_Schekl();
 
